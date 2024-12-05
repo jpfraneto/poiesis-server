@@ -104,8 +104,8 @@ func (s *APIServer) Run() error {
 	// frames v2
 	router.HandleFunc("/framesgiving/setup-writing-session", makeHTTPHandleFunc(s.handleFramesV2SetupWritingSession)).Methods("GET")
 	router.HandleFunc("/framesgiving/submit-writing-session", makeHTTPHandleFunc(s.handleFramesV2SubmitWritingSession)).Methods("POST", "OPTIONS")
-	router.HandleFunc("/framesgiving/create-anky-image", makeHTTPHandleFunc(s.handleFramesV2CreateAnkyImage)).Methods("POST")
-
+	router.HandleFunc("/framesgiving/generate-anky-image-from-session-long-string", makeHTTPHandleFunc(s.handleFramesV2GenerateAnkyImageFromSessionLongString)).Methods("POST")
+	router.HandleFunc("/framesgiving/fetch-anky-metadata-status", makeHTTPHandleFunc(s.handleFramesV2FetchAnkyMetadataStatus)).Methods("POST")
 	// WebSocket routes: TODO
 
 	log.Println("Server running on port:", s.listenAddr)
@@ -129,9 +129,109 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *APIServer) handleFramesV2CreateAnkyImage(w http.ResponseWriter, r *http.Request) error {
-	log.Println("🚀 Starting handleFramesV2CreateAnkyImage endpoint")
-	return nil
+func (s *APIServer) handleFramesV2FetchAnkyMetadataStatus(w http.ResponseWriter, r *http.Request) error {
+	log.Println("🚀 Starting handleFramesV2FetchAnkyMetadataStatus endpoint")
+
+	// Parse request body
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("❌ Error decoding request body: %v", err)
+		return fmt.Errorf("error decoding request body: %v", err)
+	}
+
+	if req.SessionID == "" {
+		log.Println("❌ Missing session_id in request body")
+		return fmt.Errorf("missing session_id in request body")
+	}
+	log.Printf("✅ Found session ID: %s", req.SessionID)
+
+	// Build path to metadata file
+	filename := fmt.Sprintf("data/framesgiving/ankys/%s.txt", req.SessionID)
+	log.Printf("🔍 Looking for metadata file: %s", filename)
+
+	// Check if file exists
+	_, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		log.Printf("❌ Metadata file not found for session: %s", req.SessionID)
+		return WriteJSON(w, http.StatusOK, map[string]string{
+			"status": "pending",
+		})
+	}
+
+	// Read file content
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		log.Printf("❌ Error reading metadata file: %v", err)
+		return fmt.Errorf("error reading metadata file: %v", err)
+	}
+
+	// Split content into lines
+	lines := strings.Split(string(content), "\n")
+	if len(lines) < 5 {
+		log.Printf("❌ Invalid metadata file format for session: %s", req.SessionID)
+		return fmt.Errorf("invalid metadata file format")
+	}
+
+	// Extract metadata components
+	tokenName := lines[0]
+	ticker := lines[1]
+	number := lines[2]
+	story := lines[3]
+	ipfsHash := lines[4]
+
+	if ipfsHash == "" {
+		log.Printf("❌ No IPFS hash found in metadata for session: %s", req.SessionID)
+		return WriteJSON(w, http.StatusOK, map[string]string{
+			"status": "pending",
+		})
+	}
+
+	log.Printf("✅ Found metadata: token=%s, ticker=%s, number=%s, ipfsHash=%s",
+		tokenName, ticker, number, ipfsHash)
+
+	return WriteJSON(w, http.StatusOK, map[string]interface{}{
+		"status":     "completed",
+		"ipfs_hash":  ipfsHash,
+		"token_name": tokenName,
+		"ticker":     ticker,
+		"number":     number,
+		"story":      story,
+	})
+}
+
+func (s *APIServer) handleFramesV2GenerateAnkyImageFromSessionLongString(w http.ResponseWriter, r *http.Request) error {
+	log.Println("🚀 Starting handleFramesV2GenerateAnkyImageFromSessionLongString endpoint")
+
+	// Parse request body
+	var req struct {
+		SessionLongString string `json:"session_long_string"`
+		Fid               string `json:"fid"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("❌ Error decoding request body: %v", err)
+		return fmt.Errorf("error decoding request body: %v", err)
+	}
+
+	// Create AnkyService instance
+	ankyService, err := services.NewAnkyService(s.store)
+	if err != nil {
+		log.Printf("❌ Error creating AnkyService: %v", err)
+		return fmt.Errorf("error creating AnkyService: %v", err)
+	}
+
+	// Call TriggerAnkyMintingProcess
+	if err := ankyService.TriggerAnkyMintingProcess(req.SessionLongString, req.Fid); err != nil {
+		log.Printf("❌ Error triggering anky minting process: %v", err)
+		return fmt.Errorf("error triggering anky minting process: %v", err)
+	}
+
+	return WriteJSON(w, http.StatusOK, map[string]string{
+		"status": "success",
+	})
 }
 
 func (s *APIServer) handleFramesV2SetupWritingSession(w http.ResponseWriter, r *http.Request) error {
@@ -217,18 +317,6 @@ func (s *APIServer) handleFramesV2SubmitWritingSession(w http.ResponseWriter, r 
 		return fmt.Errorf("error saving writing session: %v", err)
 	}
 
-	pinataService, err := services.NewPinataService()
-	if err != nil {
-		log.Printf("❌ Error creating Pinata service: %v", err)
-		return fmt.Errorf("error creating Pinata service: %v", err)
-	}
-
-	writingSessionIpfsHash, err := pinataService.UploadTXTFile(req.SessionLongString)
-	if err != nil {
-		log.Printf("❌ Error uploading writing session to Pinata: %v", err)
-		return fmt.Errorf("error uploading writing session to Pinata: %v", err)
-	}
-
 	log.Printf("📝 Parsed writing session details:\n"+
 		"UserID: %s\n"+
 		"SessionID: %s\n"+
@@ -250,7 +338,7 @@ func (s *APIServer) handleFramesV2SubmitWritingSession(w http.ResponseWriter, r 
 	if parsedSession.TimeSpent >= 480 {
 		log.Printf("🎯 Writing session qualifies for minting (duration: %d seconds, threshold: 480 seconds)", parsedSession.TimeSpent)
 		// go s.triggerAnkyMinting(parsedSession, fid)
-		go ankyService.TriggerAnkyMintingProcess(parsedSession, fid, writingSessionIpfsHash)
+		go ankyService.TriggerAnkyMintingProcess(req.SessionLongString, fid)
 	} else {
 		log.Printf("⏱️ Session duration (%d seconds) does not qualify for minting", parsedSession.TimeSpent)
 	}

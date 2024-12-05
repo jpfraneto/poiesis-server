@@ -45,6 +45,7 @@ type AnkyServiceInterface interface {
 	FetchImageDetails(id string) (*ImageDetails, error)
 	PublishToFarcaster(session *types.WritingSession) (*types.Cast, error)
 	OnboardingConversation(sessions []*types.WritingSession, ankyReflections []*types.AnkyOnboardingResponse) (string, error)
+	TriggerAnkyMintingProcess(writing_long_string string, fid string) error
 }
 
 type AnkyService struct {
@@ -90,12 +91,7 @@ func (s *AnkyService) ProcessAnkyCreationFromWritingString(ctx context.Context, 
 		return err
 	}
 
-	writingSessionIPFSHash, err := pinataService.UploadTXTFile(writing)
-	if err != nil {
-		return err
-	}
-
-	anky_processing_response, err := s.GenerateAnkyReflectionFromRawString(writing, writingSessionIPFSHash)
+	anky_processing_response, err := s.GenerateAnkyReflectionFromRawString(writing)
 	if err != nil {
 		return err
 	}
@@ -107,7 +103,7 @@ func (s *AnkyService) ProcessAnkyCreationFromWritingString(ctx context.Context, 
 	anky.Status = "reflection_completed"
 	s.store.UpdateAnky(ctx, anky)
 	anky.AnkyReflection = anky_processing_response.reflection_to_user
-	anky.ImagePrompt = anky_processing_response.image_prompt
+	anky.ImageIPFSHash = anky_processing_response.image_ipfs_hash
 	anky.Ticker = anky_processing_response.ticker
 	anky.TokenName = anky_processing_response.token_name
 	fmt.Printf("Anky++++++++++++++++++++++++++++++++++++++++: %+v\n", anky)
@@ -445,18 +441,18 @@ func (s *AnkyService) ReflectBackFromWritingSessionConversation(pastSessions []s
 // AnkyProcessingResponse holds the structured response from the LLM chain
 type AnkyProcessingResponse struct {
 	reflection_to_user string
-	image_prompt       string
+	image_ipfs_hash    string
 	token_name         string
 	ticker             string
 }
 
-func (s *AnkyService) TriggerAnkyMintingProcess(parsedSession *utils.WritingSession, fid string, writingSessionIpfsHash string) error {
+func (s *AnkyService) TriggerAnkyMintingProcess(writing_long_string string, fid string) error {
 	log.Println("🚀 Starting Anky minting process...")
 	log.Printf("📝 Processing writing session for FID: %s", fid)
 
 	// Generate reflection and metadata using LLM
 	log.Println("🤖 Generating reflection from writing content...")
-	response, err := s.GenerateAnkyReflectionFromRawString(parsedSession.RawContent, writingSessionIpfsHash)
+	response, err := s.GenerateAnkyReflectionFromRawString(writing_long_string)
 	if err != nil {
 		log.Printf("❌ Error generating reflection: %v", err)
 		return fmt.Errorf("error generating reflection: %v", err)
@@ -465,7 +461,7 @@ func (s *AnkyService) TriggerAnkyMintingProcess(parsedSession *utils.WritingSess
 	// Log the response fields
 	log.Println("✨ Generated Anky processing response:")
 	log.Printf("📖 Reflection to user: %s", response.reflection_to_user)
-	log.Printf("🎨 Image prompt: %s", response.image_prompt)
+	log.Printf("🎨 Image prompt: %s", response.image_ipfs_hash)
 	log.Printf("🏷️ Token name: %s", response.token_name)
 	log.Printf("💫 Ticker: %s", response.ticker)
 
@@ -473,8 +469,14 @@ func (s *AnkyService) TriggerAnkyMintingProcess(parsedSession *utils.WritingSess
 	return nil
 }
 
-func (s *AnkyService) GenerateAnkyReflectionFromRawString(writing string, writingSessionIPFSHash string) (*AnkyProcessingResponse, error) {
+func (s *AnkyService) GenerateAnkyReflectionFromRawString(writing string) (*AnkyProcessingResponse, error) {
 	log.Println("🚀 Starting integrated LLM processing chain for writing")
+
+	parsedSession, err := utils.ParseWritingSession(writing)
+	if err != nil {
+		log.Printf("❌ Error parsing writing session: %v", err)
+		return nil, fmt.Errorf("error parsing writing session: %v", err)
+	}
 
 	llmService := NewLLMService()
 
@@ -508,7 +510,7 @@ Format: Deliver only the story - make every word count and keep the energy focus
 			},
 			{
 				Role:    "user",
-				Content: writing,
+				Content: parsedSession.RawContent,
 			},
 		},
 	}
@@ -666,12 +668,6 @@ Example good tickers:
 
 	log.Println("🎉 Successfully generated all components!")
 
-	pinataService, err := NewPinataService()
-	if err != nil {
-		log.Printf("❌ Error creating Pinata service: %v", err)
-		return nil, fmt.Errorf("error creating Pinata service: %v", err)
-	}
-
 	ankyImageIpfsHash, err := s.GenerateAnkyFromPrompt(imagePrompt)
 	if err != nil {
 		log.Printf("❌ Error generating Anky image: %v", err)
@@ -680,39 +676,28 @@ Example good tickers:
 	log.Printf("🖼️ Generated Anky image hash: %s", ankyImageIpfsHash)
 
 	// Update NFT metadata
-	metadata := map[string]interface{}{
-		"name":        tokenName,
-		"description": story,
-		"image":       fmt.Sprintf("ipfs://%s", ankyImageIpfsHash),
-		"attributes": []map[string]string{
-			{"trait_type": "Image Prompt", "value": imagePrompt},
-			{"trait_type": "Ticker", "value": ticker},
-			{"trait_type": "Token Name", "value": tokenName},
-			{"trait_type": "Story", "value": story},
-			{"trait_type": "Writing Session", "value": writingSessionIPFSHash},
-		},
-	}
+	// Create metadata string in required format
+	metadataContent := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", tokenName, ticker, 0000000, story, ankyImageIpfsHash)
 
-	metadataHash, err := pinataService.UploadJSONMetadata(metadata)
+	// Create directory if it doesn't exist
+	err = os.MkdirAll("data/framesgiving/ankys", 0755)
 	if err != nil {
-		log.Printf("❌ Error uploading metadata: %v", err)
-		return nil, fmt.Errorf("error uploading metadata: %v", err)
+		log.Printf("❌ Error creating directory: %v", err)
+		return nil, fmt.Errorf("error creating directory: %v", err)
 	}
-	log.Printf("📄 Metadata pinned to IPFS: %s", metadataHash)
 
-	// Reveal the Anky NFT on-chain
-	// err = blockchainService.RevealAnky(context.Background(), metadataHash, ipfsHash)
-	// if err != nil {
-	// 	log.Printf("❌ Error revealing Anky on blockchain: %v", err)
-	// 	return nil, fmt.Errorf("error revealing Anky: %v", err)
-	// }
-	// log.Printf("⛓️ Successfully revealed Anky on blockchain")
-
-	// HERE WE NEED TO CALL THE SMART CONTRACT TO REVEAL THE ANKY AND DEPLOY THE NFT
+	// Write metadata to file
+	filename := fmt.Sprintf("data/framesgiving/ankys/%s.txt", parsedSession.SessionID)
+	err = os.WriteFile(filename, []byte(metadataContent), 0644)
+	if err != nil {
+		log.Printf("❌ Error writing metadata file: %v", err)
+		return nil, fmt.Errorf("error writing metadata file: %v", err)
+	}
+	log.Printf("📄 Metadata written to: %s", filename)
 
 	return &AnkyProcessingResponse{
 		reflection_to_user: story,
-		image_prompt:       imagePrompt,
+		image_ipfs_hash:    ankyImageIpfsHash,
 		token_name:         tokenName,
 		ticker:             ticker,
 	}, nil
